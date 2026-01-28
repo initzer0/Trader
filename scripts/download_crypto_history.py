@@ -11,7 +11,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from trader.data.binance_ohlc import (
+from trader.data_gathering.binance_ohlc import (
     create_binance_client,
     update_ohlc_csv,
 )  # noqa: E402
