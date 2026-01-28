@@ -13,6 +13,12 @@ seaborn>=0.13.0
 scikit-learn>=1.4.0
 statsmodels>=0.14.0
 
+# Deep learning
+torch>=2.2.0
+
+# Stats / tests (used in notebooks)
+scipy>=1.12.0
+
 # optuna
 optuna>=3.5.0
 optuna-dashboard>=0.3.0
