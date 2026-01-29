@@ -23,8 +23,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--interval",
-        default="1h",
-        help="Binance kline interval (e.g. 1m, 5m, 15m, 1h, 4h, 1d). Default: 1h",
+        default="1m",
+        help="Binance kline interval (e.g. 1m, 5m, 15m, 1h, 4h, 1d). Default: 1m",
     )
     parser.add_argument(
         "--start",

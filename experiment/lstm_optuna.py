@@ -168,6 +168,74 @@ def _plot_test_trades(
     plt.close(fig)
 
 
+def _plot_hist_with_stats(
+    *,
+    ax: plt.Axes,
+    data: np.ndarray,
+    title: str,
+    bins: int = 120,
+) -> None:
+    data = np.asarray(data, dtype=float)
+    data = data[np.isfinite(data)]
+    if data.size == 0:
+        ax.set_title(title)
+        ax.text(0.5, 0.5, "No data", ha="center", va="center")
+        return
+
+    ax.hist(data, bins=bins, color="tab:blue", alpha=0.75)
+    mean = float(np.mean(data))
+    var = float(np.var(data))
+    ax.set_title(title)
+    ax.set_ylabel("count")
+    ax.text(
+        0.98,
+        0.95,
+        f"mean={mean:.6g}\nvar={var:.6g}\nN={data.size}",
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=9,
+        bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"),
+    )
+
+
+def _plot_input_output_distributions(
+    *,
+    out_dir: Path,
+    split: "object",  # SplitSamples
+) -> None:
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        x_train = split.train.x.reshape(-1)
+        x_val = split.val.x.reshape(-1)
+        x_test = split.test.x.reshape(-1)
+
+        y_train = split.train.y.reshape(-1)
+        y_val = split.val.y.reshape(-1)
+        y_test = split.test.y.reshape(-1)
+
+        fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
+        _plot_hist_with_stats(ax=axes[0], data=x_train, title="Input (train)")
+        _plot_hist_with_stats(ax=axes[1], data=x_val, title="Input (val)")
+        _plot_hist_with_stats(ax=axes[2], data=x_test, title="Input (test)")
+        axes[-1].set_xlabel("input value")
+        fig.tight_layout()
+        fig.savefig(out_dir / "input_distribution.png", dpi=150)
+        plt.close(fig)
+
+        fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
+        _plot_hist_with_stats(ax=axes[0], data=y_train, title="Output (train)")
+        _plot_hist_with_stats(ax=axes[1], data=y_val, title="Output (val)")
+        _plot_hist_with_stats(ax=axes[2], data=y_test, title="Output (test)")
+        axes[-1].set_xlabel("output value")
+        fig.tight_layout()
+        fig.savefig(out_dir / "output_distribution.png", dpi=150)
+        plt.close(fig)
+    except Exception:
+        pass
+
+
 def objective(
     trial: optuna.Trial,
     *,
@@ -251,7 +319,12 @@ def objective(
     )
 
     # Evaluate on validation with a trading rule
-    val_pred = predict_regressor(model, x=split.val.x, device=device)
+    val_pred = predict_regressor(
+        model,
+        x=split.val.x,
+        device=device,
+        batch_size=train_cfg.batch_size,
+    )
     val_bt = backtest_long_or_cash(
         close=series.close,
         base_index=split.val.base_index,
@@ -261,7 +334,12 @@ def objective(
     )
 
     # Also compute test metrics for reference
-    test_pred = predict_regressor(model, x=test_x, device=device)
+    test_pred = predict_regressor(
+        model,
+        x=test_x,
+        device=device,
+        batch_size=train_cfg.batch_size,
+    )
     test_bt = backtest_long_or_cash(
         close=series.close,
         base_index=split.test.base_index,
@@ -292,6 +370,9 @@ def objective(
     if artifact_mode.lower() == "all":
         trial_dir = run_dir / f"trial_{trial.number:05d}"
         trial_dir.mkdir(parents=True, exist_ok=True)
+
+        # Data distribution plots (post-preprocessing)
+        _plot_input_output_distributions(out_dir=trial_dir, split=split)
 
         cfg = {
             "csv": str(csv_path),
@@ -470,7 +551,7 @@ def main() -> int:
         "--storage", default=str(PROJECT_ROOT / "experiment" / "optuna.db")
     )
     parser.add_argument("--study", default="lstm_btc_returns")
-    parser.add_argument("--trials", type=int, default=50)
+    parser.add_argument("--trials", type=int, default=100)
     parser.add_argument(
         "--fee", type=float, default=0.001, help="Trading fee rate (0.001 = 0.1%)"
     )

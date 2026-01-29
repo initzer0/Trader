@@ -127,15 +127,33 @@ def train_regressor(
 
 
 def predict_regressor(
-    model: "object", *, x: np.ndarray, device: str = "cpu"
+    model: "object",
+    *,
+    x: np.ndarray,
+    device: str = "cpu",
+    batch_size: int = 2048,
 ) -> np.ndarray:
     import torch
+    from torch.utils.data import DataLoader, TensorDataset
 
     model.eval()
     dev = torch.device(device)
     model = model.to(dev)
 
-    xb = torch.from_numpy(x).float().unsqueeze(-1).to(dev)
+    if batch_size <= 0:
+        raise ValueError("batch_size must be > 0")
+
+    x_tensor = torch.from_numpy(x).float().unsqueeze(-1)
+    loader = DataLoader(TensorDataset(x_tensor), batch_size=batch_size, shuffle=False)
+
+    preds: list[np.ndarray] = []
     with torch.no_grad():
-        pred = model(xb).detach().cpu().numpy().reshape(-1)
-    return pred.astype(np.float64)
+        for (xb,) in loader:
+            xb = xb.to(dev)
+            out = model(xb).detach().cpu().numpy().reshape(-1)
+            preds.append(out)
+
+    if not preds:
+        return np.asarray([], dtype=np.float64)
+
+    return np.concatenate(preds).astype(np.float64)
