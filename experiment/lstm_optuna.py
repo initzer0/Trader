@@ -28,17 +28,47 @@ if str(SRC_DIR) not in sys.path:
 from trader.backtest.switching import backtest_long_or_cash
 from trader.ml.data import (
     DataConfig,
+    InferenceSamples,
+    Samples,
+    SplitSamples,
     default_btc_1m_csv,
+    make_inference_samples,
     load_ohlc_close_series,
     make_supervised_samples,
+    PreparedSeries,
     time_split_samples,
 )
-from trader.ml.models import LSTMReturnRegressor
+from trader.ml.models import (
+    CNNReturnRegressor,
+    GRUReturnRegressor,
+    LSTMReturnRegressor,
+    MLPReturnRegressor,
+)
 from trader.ml.torch_dataset import ReturnSequenceTorchDataset
 from trader.ml.train import TrainConfig, predict_regressor, train_regressor
 
 
 _STOP_REQUESTED = False
+
+
+_RAW_SERIES_CACHE: dict[str, PreparedSeries] = {}
+
+
+def _get_raw_close_series(csv_path: Path) -> PreparedSeries:
+    """Load the 1m close series once per process for plotting.
+
+    Modeling often downsamples heavily (e.g. 12h bars). For evaluation plots we still
+    want to visualize the underlying 1m price action.
+    """
+
+    key = str(csv_path)
+    cached = _RAW_SERIES_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    raw = load_ohlc_close_series(csv_path, downsample_every=1)
+    _RAW_SERIES_CACHE[key] = raw
+    return raw
 
 
 def _request_stop(signum: int, frame: Any) -> None:  # noqa: ARG001
@@ -96,21 +126,26 @@ def _cleanup_failed_trials(study: optuna.Study) -> int:
 def _plot_test_trades(
     *,
     out_path: Path,
-    times: np.ndarray,
-    close: np.ndarray,
+    price_times: np.ndarray,
+    price_close: np.ndarray,
+    equity_times: np.ndarray,
+    equity_net: np.ndarray,
+    buy_hold_equity: np.ndarray,
     decision_times: np.ndarray,
-    decision_close: np.ndarray,
     positions_btc: np.ndarray,
     title: str,
     max_points: int = 50_000,
 ) -> None:
-    """Plot BTC close over test period with a position overlay.
+    """Plot test period with strategy equity, buy&hold, and trade markers.
 
-    - Blue line: BTC close price
-    - Orange step: model position (0=USDT, 1=BTC) (scaled to right axis)
+    - Blue line: BTC buy&hold equity (starting at 1.0)
+    - Black line: strategy net equity (starting at 1.0)
+    - Orange step: model position (0=USDT, 1=BTC)
+    - Green dashed vline: switch into BTC
+    - Red dashed vline: switch out of BTC
     """
 
-    if times.size == 0 or decision_times.size == 0:
+    if price_times.size == 0 or decision_times.size == 0:
         return
 
     # Downsample for plotting performance.
@@ -122,16 +157,34 @@ def _plot_test_trades(
         step = max(1, int(np.ceil(t.size / nmax)))
         return t[::step], y[::step]
 
-    pt_t, pt_close = downsample(times, close, max_points)
+    pt_t, pt_close = downsample(price_times, price_close, max_points)
     dt_t, dt_pos = downsample(decision_times, positions_btc.astype(float), max_points)
 
-    fig, ax1 = plt.subplots(figsize=(14, 6))
-    ax1.plot(pt_t, pt_close, linewidth=1.0, label="BTC close")
-    ax1.set_xlabel("Datetime (UTC)")
-    ax1.set_ylabel("BTC close")
-    ax1.set_title(title)
+    eq_t, eq_net = downsample(equity_times, equity_net, max_points)
+    _, eq_hold = downsample(equity_times, buy_hold_equity, max_points)
 
-    ax2 = ax1.twinx()
+    fig, (ax_price, ax_eq) = plt.subplots(
+        2,
+        1,
+        figsize=(14, 8),
+        sharex=True,
+        gridspec_kw={"height_ratios": [1.2, 1.0]},
+    )
+
+    # Top panel: high-resolution BTC close.
+    ax_price.plot(
+        pt_t, pt_close, linewidth=0.8, color="tab:blue", label="BTC close (1m)"
+    )
+    ax_price.set_ylabel("BTC close")
+    ax_price.set_title(title)
+
+    # Bottom panel: equity comparison.
+    ax_eq.plot(eq_t, eq_hold, linewidth=1.2, label="Buy & hold (BTC)", color="tab:blue")
+    ax_eq.plot(eq_t, eq_net, linewidth=1.2, label="Strategy (net)", color="black")
+    ax_eq.set_xlabel("Datetime (UTC)")
+    ax_eq.set_ylabel("Equity (start=1.0)")
+
+    ax2 = ax_eq.twinx()
     ax2.step(
         dt_t,
         dt_pos,
@@ -143,25 +196,52 @@ def _plot_test_trades(
     ax2.set_ylim(-0.05, 1.05)
     ax2.set_ylabel("Position")
 
+    # Quick stats box to reduce confusion when eyeballing the curves.
+    try:
+        s_final = float(eq_net[-1]) if len(eq_net) else float("nan")
+        h_final = float(eq_hold[-1]) if len(eq_hold) else float("nan")
+        ax_eq.text(
+            0.99,
+            0.02,
+            f"final(strategy)={s_final:.3f}\nfinal(hold)={h_final:.3f}",
+            transform=ax_eq.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=9,
+            bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"),
+        )
+    except Exception:
+        pass
+
     # Mark trade events (switches) but keep it bounded.
-    switches = np.flatnonzero(np.diff(positions_btc.astype(int)) != 0) + 1
+    pos_i = positions_btc.astype(int)
+    switches = np.flatnonzero(np.diff(pos_i) != 0) + 1
+    # Also include the initial switch vs starting in USDT.
+    if pos_i.size and pos_i[0] == 1:
+        switches = np.concatenate([np.asarray([0], dtype=int), switches])
+
     if switches.size > 0:
         max_markers = 2000
         if switches.size > max_markers:
             step = int(np.ceil(switches.size / max_markers))
             switches = switches[::step]
-        ax1.vlines(
-            decision_times[switches],
-            ymin=np.min(pt_close),
-            ymax=np.max(pt_close),
-            alpha=0.06,
-            linewidth=0.5,
-        )
 
-    # Legend (combine both axes)
-    h1, l1 = ax1.get_legend_handles_labels()
+        for s in switches:
+            into_btc = bool(pos_i[s] == 1)
+            for ax in (ax_price, ax_eq):
+                ax.axvline(
+                    decision_times[s],
+                    linestyle="--",
+                    linewidth=0.8,
+                    alpha=0.22,
+                    color=("green" if into_btc else "red"),
+                )
+
+    # Legends
+    ax_price.legend(loc="upper left")
+    h1, l1 = ax_eq.get_legend_handles_labels()
     h2, l2 = ax2.get_legend_handles_labels()
-    ax1.legend(h1 + h2, l1 + l2, loc="upper left")
+    ax_eq.legend(h1 + h2, l1 + l2, loc="upper left")
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
@@ -245,34 +325,36 @@ def objective(
     run_dir: Path,
     artifact_mode: str,
 ) -> float:
+    # Expanded search space based on boundary hits.
     downsample_every = trial.suggest_categorical(
-        "downsample_every", [1, 5, 15, 60, 240, 1440]
+        "downsample_every", [360, 720, 1440, 2880]
     )
-    lookback = trial.suggest_int("lookback", 10, 120)
+    lookback = trial.suggest_int("lookback", 30, 120)
     prediction_horizon = trial.suggest_categorical(
-        "prediction_horizon", [1, 3, 5, 15, 60]
+        "prediction_horizon", [60, 90, 120, 240, 350, 720]
     )
 
     # How often we make a prediction / decision / potential trade.
     # This is distinct from prediction_horizon: e.g. predict 12h ahead but decide every 6h.
     decision_every = trial.suggest_categorical(
         "decision_every",
-        [1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30, 60, 120, 240, 360, 720, 1440],
+        [5, 10, 15, 20, 30, 45, 60, 120],
     )
 
     # For this backtest, trade cadence equals decision cadence (we can rebalance each decision).
     trade_horizon = decision_every
 
-    hidden_size = trial.suggest_categorical("hidden_size", [16, 32, 64, 128])
-    num_layers = trial.suggest_int("num_layers", 1, 3)
-    dropout = trial.suggest_float("dropout", 0.0, 0.4)
+    model_type = trial.suggest_categorical("model_type", ["lstm", "gru", "mlp", "cnn"])
 
-    lr = trial.suggest_float("lr", 1e-4, 3e-3, log=True)
+    lr = trial.suggest_float("lr", 3e-4, 3e-3, log=True)
     weight_decay = trial.suggest_categorical(
-        "weight_decay", [0.0, 1e-8, 1e-6, 1e-4, 1e-3]
+        "weight_decay", [0.0, 1e-5, 1e-4, 1e-3, 1e-2]
     )
-    batch_size = trial.suggest_categorical("batch_size", [256, 512, 1024])
-    epochs = trial.suggest_int("epochs", 3, 10)
+    batch_size = trial.suggest_categorical("batch_size", [512, 1024, 2048])
+    epochs = trial.suggest_int("epochs", 8, 24)
+
+    normalize_inputs = trial.suggest_categorical("normalize_inputs", [True, False])
+    normalize_outputs = trial.suggest_categorical("normalize_outputs", [True, False])
 
     try:
         series = load_ohlc_close_series(csv_path, downsample_every=downsample_every)
@@ -296,15 +378,113 @@ def objective(
         trial.set_user_attr("pruned_reason", str(exc))
         raise optuna.TrialPruned(str(exc))
 
+    x_train = split.train.x
+    x_val = split.val.x
+    x_test = split.test.x
+    y_train = split.train.y
+    y_val = split.val.y
+    y_test = split.test.y
+
+    y_test_raw = y_test.copy()
+
+    eps = 1e-8
+    if normalize_inputs:
+        x_mean = x_train.mean(axis=0)
+        x_std = x_train.std(axis=0)
+        x_std = np.where(x_std < eps, 1.0, x_std)
+        x_train = (x_train - x_mean) / x_std
+        x_val = (x_val - x_mean) / x_std
+        x_test = (x_test - x_mean) / x_std
+    else:
+        x_mean = np.zeros(x_train.shape[1], dtype=np.float32)
+        x_std = np.ones(x_train.shape[1], dtype=np.float32)
+
+    if normalize_outputs:
+        y_mean = float(np.mean(y_train))
+        y_std = float(np.std(y_train))
+        if y_std < eps:
+            y_std = 1.0
+        y_train = (y_train - y_mean) / y_std
+        y_val = (y_val - y_mean) / y_std
+        y_test = (y_test - y_mean) / y_std
+    else:
+        y_mean = 0.0
+        y_std = 1.0
+
+    split = SplitSamples(
+        train=Samples(x=x_train, y=y_train, base_index=split.train.base_index),
+        val=Samples(x=x_val, y=y_val, base_index=split.val.base_index),
+        test=Samples(x=x_test, y=y_test, base_index=split.test.base_index),
+    )
+
     train_ds = ReturnSequenceTorchDataset(split.train.x, split.train.y)
     val_ds = ReturnSequenceTorchDataset(split.val.x, split.val.y)
     test_x = split.test.x
 
-    model = LSTMReturnRegressor(
-        hidden_size=hidden_size,
-        num_layers=num_layers,
-        dropout=dropout,
-    )
+    if model_type == "lstm":
+        hidden_size = trial.suggest_categorical("hidden_size", [64, 128, 192, 256])
+        num_layers = trial.suggest_int("num_layers", 1, 3)
+        dropout = trial.suggest_float("dropout", 0.0, 0.4)
+        model = LSTMReturnRegressor(
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+        )
+        model_cfg = {
+            "type": "lstm",
+            "hidden_size": hidden_size,
+            "num_layers": num_layers,
+            "dropout": dropout,
+        }
+    elif model_type == "gru":
+        hidden_size = trial.suggest_categorical("hidden_size", [64, 128, 192, 256])
+        num_layers = trial.suggest_int("num_layers", 1, 3)
+        dropout = trial.suggest_float("dropout", 0.0, 0.4)
+        model = GRUReturnRegressor(
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+        )
+        model_cfg = {
+            "type": "gru",
+            "hidden_size": hidden_size,
+            "num_layers": num_layers,
+            "dropout": dropout,
+        }
+    elif model_type == "mlp":
+        mlp_hidden = trial.suggest_categorical("mlp_hidden", [32, 64, 128, 256])
+        mlp_layers = trial.suggest_int("mlp_layers", 1, 3)
+        mlp_dropout = trial.suggest_float("mlp_dropout", 0.0, 0.4)
+        model = MLPReturnRegressor(
+            lookback=lookback,
+            hidden_size=mlp_hidden,
+            num_layers=mlp_layers,
+            dropout=mlp_dropout,
+        )
+        model_cfg = {
+            "type": "mlp",
+            "hidden_size": mlp_hidden,
+            "num_layers": mlp_layers,
+            "dropout": mlp_dropout,
+        }
+    else:
+        cnn_base = trial.suggest_categorical("cnn_base_channels", [32, 64, 128])
+        cnn_layers = trial.suggest_int("cnn_layers", 1, 3)
+        cnn_kernel = trial.suggest_categorical("cnn_kernel", [3, 5, 7])
+        cnn_dropout = trial.suggest_float("cnn_dropout", 0.0, 0.4)
+        model = CNNReturnRegressor(
+            base_channels=cnn_base,
+            num_layers=cnn_layers,
+            kernel_size=cnn_kernel,
+            dropout=cnn_dropout,
+        )
+        model_cfg = {
+            "type": "cnn",
+            "base_channels": cnn_base,
+            "num_layers": cnn_layers,
+            "kernel_size": cnn_kernel,
+            "dropout": cnn_dropout,
+        }
 
     train_cfg = TrainConfig(
         epochs=epochs,
@@ -325,6 +505,8 @@ def objective(
         device=device,
         batch_size=train_cfg.batch_size,
     )
+    if normalize_outputs:
+        val_pred = val_pred * y_std + y_mean
     val_bt = backtest_long_or_cash(
         close=series.close,
         base_index=split.val.base_index,
@@ -333,19 +515,50 @@ def objective(
         fee_rate=fee_rate,
     )
 
-    # Also compute test metrics for reference
+    # --- Test evaluation ---
+    # Force a fixed calendar interval so trials are comparable.
+    # Test interval: [2025-01-01, 2026-01-01) i.e. through end of 2025.
+    split_dt = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    test_end_excl = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    # Clamp to available data (this repo's BTC CSV extends into 2026).
+    test_start_i = int(series.times.searchsorted(split_dt, side="left"))
+    test_end_excl_i = int(series.times.searchsorted(test_end_excl, side="left"))
+    test_end_i = int(min(series.close.size - 1, max(test_start_i, test_end_excl_i - 1)))
+
+    # Generate inference windows up to the chosen end index.
+    test_infer = make_inference_samples(
+        series,
+        lookback=lookback,
+        sample_every=decision_every,
+        start_index=0,
+        end_index=test_end_i,
+    )
+
+    base_t = series.times[test_infer.base_index]
+    test_mask = (base_t >= split_dt) & (base_t < test_end_excl)
+    test_base = test_infer.base_index[test_mask]
+    test_x_infer = test_infer.x[test_mask]
+
+    if normalize_inputs:
+        test_x_infer = (test_x_infer - x_mean) / x_std
+
     test_pred = predict_regressor(
         model,
-        x=test_x,
+        x=test_x_infer,
         device=device,
         batch_size=train_cfg.batch_size,
     )
+    if normalize_outputs:
+        test_pred = test_pred * y_std + y_mean
+
     test_bt = backtest_long_or_cash(
         close=series.close,
-        base_index=split.test.base_index,
+        base_index=test_base,
         pred_log_return=test_pred,
         trade_horizon=trade_horizon,
         fee_rate=fee_rate,
+        end_index=test_end_i,
     )
 
     trial.set_user_attr("val_mse", train_metrics["val_mse"])
@@ -359,6 +572,11 @@ def objective(
     trial.set_user_attr("val_final_eur_gross", val_bt.final_value_gross)
     trial.set_user_attr("val_final_eur_net", val_bt.final_value_net)
     trial.set_user_attr("val_trades", val_bt.n_trades)
+    trial.set_user_attr("model_type", model_type)
+    trial.set_user_attr("normalize_inputs", normalize_inputs)
+    trial.set_user_attr("normalize_outputs", normalize_outputs)
+    trial.set_user_attr("y_mean", y_mean)
+    trial.set_user_attr("y_std", y_std)
 
     trial.set_user_attr("test_return_gross", test_bt.total_return_gross)
     trial.set_user_attr("test_return_net", test_bt.total_return_net)
@@ -383,27 +601,33 @@ def objective(
             "prediction_horizon": prediction_horizon,
             "decision_every": decision_every,
             "trade_horizon": trade_horizon,
-            "model": {
-                "hidden_size": hidden_size,
-                "num_layers": num_layers,
-                "dropout": dropout,
-            },
+            "model": model_cfg,
             "train": {
                 "epochs": epochs,
                 "batch_size": batch_size,
                 "lr": lr,
                 "weight_decay": weight_decay,
             },
+            "normalization": {
+                "inputs": bool(normalize_inputs),
+                "outputs": bool(normalize_outputs),
+                "x_mean": x_mean.tolist(),
+                "x_std": x_std.tolist(),
+                "y_mean": float(y_mean),
+                "y_std": float(y_std),
+            },
             "split_dt": "2025-01-01T00:00:00+00:00",
         }
         _write_json(trial_dir / "config.json", cfg)
 
         # Add test window information (interpreting equity curves as € from 1€ initial).
-        test_base = split.test.base_index
-        test_start_time = series.times[int(test_base.min())]
-        test_end_time = series.times[
-            int(min(series.close.size - 1, test_base.max() + trade_horizon))
-        ]
+        test_start_time = split_dt
+        test_end_time = series.times[int(test_end_i)]
+
+        # Buy & hold benchmark over the same interval.
+        hold_start_px = float(series.close[test_start_i])
+        hold_end_px = float(series.close[test_end_i])
+        buy_hold_final = hold_end_px / hold_start_px
 
         eval_payload = {
             "trial_number": trial.number,
@@ -426,6 +650,7 @@ def objective(
                 "final_eur_gross": test_bt.final_value_gross,
                 "final_eur_net": test_bt.final_value_net,
                 "n_trades": test_bt.n_trades,
+                "buy_hold_final_eur": float(buy_hold_final),
             },
         }
         _write_json(trial_dir / "eval.json", eval_payload)
@@ -476,9 +701,15 @@ def objective(
             np.save(
                 trial_dir / "test_pred_log_return.npy", test_pred.astype(np.float32)
             )
-            np.save(
-                trial_dir / "test_true_log_return.npy", split.test.y.astype(np.float32)
-            )
+            # true return is not always available at the tail (depends on prediction_horizon)
+            true_arr = np.full(test_pred.shape, np.nan, dtype=np.float32)
+            for k, i in enumerate(test_base.astype(int)):
+                j = i + prediction_horizon
+                if j < series.close.size:
+                    true_arr[k] = float(
+                        np.log(series.close[j]) - np.log(series.close[i])
+                    )
+            np.save(trial_dir / "test_true_log_return.npy", true_arr)
             np.save(
                 trial_dir / "test_equity_curve_gross.npy",
                 test_bt.equity_curve_gross.astype(np.float64),
@@ -496,6 +727,10 @@ def objective(
             decision_times = series.times[test_base]
             decision_close = series.close[test_base]
             trade_event = np.zeros_like(positions_btc, dtype=bool)
+            # Include the initial switch vs the backtest's start_in.
+            start_in_btc = False  # backtest_long_or_cash default start_in="USDT"
+            if positions_btc.size:
+                trade_event[0] = bool(positions_btc[0]) != start_in_btc
             trade_event[1:] = positions_btc[1:] != positions_btc[:-1]
             out_csv = trial_dir / "test_decisions.csv"
             header = (
@@ -503,11 +738,18 @@ def objective(
             )
             with out_csv.open("w", encoding="utf-8") as f:
                 f.write(header)
+                true_arr = np.full(test_pred.shape, np.nan, dtype=np.float64)
+                for k, i in enumerate(test_base.astype(int)):
+                    j = i + prediction_horizon
+                    if j < series.close.size:
+                        true_arr[k] = float(
+                            np.log(series.close[j]) - np.log(series.close[i])
+                        )
                 for t, c, p, ytrue, pos, te in zip(
                     decision_times.astype(str).to_numpy(),
                     decision_close,
                     test_pred,
-                    split.test.y,
+                    true_arr,
                     positions_btc,
                     trade_event,
                 ):
@@ -522,19 +764,50 @@ def objective(
             dec_times = series.times[test_base].to_numpy()
             dec_close = series.close[test_base]
 
-            start_i = int(test_base.min())
-            end_i = int(min(series.close.size - 1, test_base.max() + trade_horizon))
-            full_times = series.times[start_i : end_i + 1].to_numpy()
-            full_close = series.close[start_i : end_i + 1]
+            # High-resolution (1m) price plot over the same calendar window.
+            raw = _get_raw_close_series(csv_path)
+            raw_start_i = int(raw.times.searchsorted(split_dt, side="left"))
+            raw_end_excl_i = int(raw.times.searchsorted(test_end_excl, side="left"))
+            raw_end_i = int(
+                min(raw.close.size - 1, max(raw_start_i, raw_end_excl_i - 1))
+            )
+            price_times = raw.times[raw_start_i : raw_end_i + 1].to_numpy()
+            price_close = raw.close[raw_start_i : raw_end_i + 1]
+
+            start_i = test_start_i
+            end_i = test_end_i
+
+            # Equity curve timeline (mark-to-market at each decision's horizon)
+            used_n = int(test_bt.positions.size)
+            used_base = test_base[:used_n].astype(int)
+            eq_t = np.empty(used_n + 1, dtype=object)
+            eq_t[0] = series.times[used_base[0]].to_pydatetime()
+            for k in range(used_n):
+                i = int(used_base[k])
+                j = int(min(i + trade_horizon, end_i))
+                eq_t[k + 1] = series.times[j].to_pydatetime()
+
+            # Buy&hold equity on the same equity timestamps
+            start_px = float(series.close[start_i])
+            bh = np.empty(used_n + 1, dtype=np.float64)
+            bh[0] = 1.0
+            for k in range(used_n):
+                j = int(min(int(used_base[k]) + trade_horizon, end_i))
+                bh[k + 1] = float(series.close[j] / start_px)
 
             _plot_test_trades(
                 out_path=trial_dir / "test_trades.png",
-                times=full_times,
-                close=full_close,
+                price_times=price_times,
+                price_close=price_close,
+                equity_times=np.asarray(eq_t),
+                equity_net=test_bt.equity_curve_net.astype(np.float64),
+                buy_hold_equity=bh,
                 decision_times=dec_times,
-                decision_close=dec_close,
                 positions_btc=(test_pred > 0.0),
-                title=f"Test trades (trial {trial.number}) | net={test_bt.final_value_net:.3f}€ gross={test_bt.final_value_gross:.3f}€",
+                title=(
+                    f"Test (2025) | trial {trial.number} | net={test_bt.final_value_net:.3f} "
+                    f"vs hold={buy_hold_final:.3f} (start=1.0)"
+                ),
             )
         except Exception:
             pass

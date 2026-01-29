@@ -45,6 +45,7 @@ def backtest_long_or_cash(
     trade_horizon: int = 1,
     fee_rate: float = 0.001,
     start_in: Position = "USDT",
+    end_index: int | None = None,
 ) -> BacktestResult:
     """Simple BTC/USDT switching strategy.
 
@@ -75,6 +76,14 @@ def backtest_long_or_cash(
     base_index = base_index[order]
     pred_log_return = pred_log_return[order]
 
+    if end_index is None:
+        end_index = int(close.size - 1)
+    else:
+        end_index = int(end_index)
+
+    if end_index < 1 or end_index >= close.size:
+        raise ValueError("end_index must be in [1, len(close)-1]")
+
     n = base_index.size
     equity_g = np.ones(n + 1, dtype=np.float64)
     equity_n = np.ones(n + 1, dtype=np.float64)
@@ -85,13 +94,15 @@ def backtest_long_or_cash(
 
     for k in range(n):
         i = int(base_index[k])
-        j = i + trade_horizon
-        if j >= close.size:
+        if i >= end_index:
             # No future price to realize; stop.
             equity_g = equity_g[: k + 1]
             equity_n = equity_n[: k + 1]
             positions = positions[:k]
             break
+
+        # Mark-to-market at either the scheduled horizon or the requested end.
+        j = min(i + trade_horizon, end_index)
 
         pos: Position = "BTC" if pred_log_return[k] > 0.0 else "USDT"
         positions[k] = pos

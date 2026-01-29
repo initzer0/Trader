@@ -38,6 +38,12 @@ class Samples:
     base_index: np.ndarray
 
 
+@dataclass(frozen=True)
+class InferenceSamples:
+    x: np.ndarray
+    base_index: np.ndarray
+
+
 def default_btc_1m_csv(project_root: Path) -> Path:
     return project_root / "data" / "crypto" / "btc" / "BTCUSDT_1m.csv"
 
@@ -121,6 +127,56 @@ def make_supervised_samples(
         y[j] = float(log_close[i + prediction_horizon] - log_close[i])
 
     return Samples(x=x, y=y, base_index=base_indices)
+
+
+def make_inference_samples(
+    series: PreparedSeries,
+    *,
+    lookback: int,
+    sample_every: int = 1,
+    start_index: int = 0,
+    end_index: Optional[int] = None,
+) -> InferenceSamples:
+    """Create input windows (X) for inference/trading without requiring targets.
+
+    This is crucial for evaluating a strategy over a fixed calendar interval,
+    because supervised targets stop at `close.size - prediction_horizon - 1`,
+    but in live trading you still produce predictions near the end.
+    """
+
+    if lookback <= 0:
+        raise ValueError("lookback must be > 0")
+    if sample_every <= 0:
+        raise ValueError("sample_every must be > 0")
+
+    close = series.close
+    if end_index is None:
+        end_index = int(close.size - 1)
+    else:
+        end_index = int(end_index)
+
+    start_index = int(start_index)
+    if end_index <= 0 or end_index >= close.size:
+        raise ValueError("end_index out of range")
+
+    start = max(lookback, 1, start_index)
+    end = end_index
+    if end < start:
+        raise ValueError("Not enough data for requested lookback")
+
+    log_close = np.log(close)
+    realized = np.diff(log_close, prepend=np.nan)
+
+    base_indices = np.arange(start, end + 1, sample_every, dtype=int)
+    x = np.empty((base_indices.size, lookback), dtype=np.float32)
+
+    for j, i in enumerate(base_indices):
+        window = realized[i - lookback + 1 : i + 1]
+        if np.isnan(window).any():
+            raise RuntimeError("Unexpected NaN in realized return window")
+        x[j, :] = window.astype(np.float32)
+
+    return InferenceSamples(x=x, base_index=base_indices)
 
 
 @dataclass(frozen=True)

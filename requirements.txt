@@ -3,6 +3,10 @@ python-binance>=1.0.19
 python-dotenv>=1.0.1
 tqdm>=4.66.0
 
+# --- Sentiment / signals ---
+requests>=2.31.0
+pytrends>=4.9.2
+
 # --- Notebook / analysis / ML ---
 jupyter>=1.1.1
 ipykernel>=6.29.0
